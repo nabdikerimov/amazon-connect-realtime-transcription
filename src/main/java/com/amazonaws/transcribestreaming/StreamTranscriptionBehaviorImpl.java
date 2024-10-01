@@ -7,6 +7,7 @@ import software.amazon.awssdk.services.transcribestreaming.model.StartStreamTran
 import software.amazon.awssdk.services.transcribestreaming.model.TranscriptEvent;
 import software.amazon.awssdk.services.transcribestreaming.model.TranscriptResultStream;
 
+
 /**
  * Implementation of StreamTranscriptionBehavior to define how a stream response is handled.
  *
@@ -30,27 +31,35 @@ public class StreamTranscriptionBehaviorImpl implements StreamTranscriptionBehav
     private static final Logger logger = LoggerFactory.getLogger(StreamTranscriptionBehaviorImpl.class);
     private final TranscribedSegmentWriter segmentWriter;
     private final String tableName;
+    private final String conversationTableName;
 
-    public StreamTranscriptionBehaviorImpl(TranscribedSegmentWriter segmentWriter, String tableName) {
+
+      public StreamTranscriptionBehaviorImpl(TranscribedSegmentWriter segmentWriter, String tableName, String conversationTableName) {
         this.segmentWriter = segmentWriter;
         this.tableName = tableName;
+        this.conversationTableName = conversationTableName;
     }
 
-    @Override
+   @Override
     public void onError(Throwable e) {
         logger.error("Error in middle of stream: ", e);
     }
 
     @Override
     public void onStream(TranscriptResultStream e) {
-        // EventResultStream has other fields related to the timestamp of the transcripts in it.
-        // Please refer to the javadoc of TranscriptResultStream for more details
-        segmentWriter.writeToDynamoDB((TranscriptEvent) e, tableName);
+        // Ensure the event is an instance of TranscriptEvent before casting
+        if (e instanceof TranscriptEvent) {
+            TranscriptEvent transcriptEvent = (TranscriptEvent) e;
+            // Write the transcript to DynamoDB, including the conversation table
+            segmentWriter.writeToDynamoDB(transcriptEvent, tableName, conversationTableName);
+        } else {
+            logger.warn("Received an unknown TranscriptResultStream event.");
+        }
     }
 
     @Override
     public void onResponse(StartStreamTranscriptionResponse r) {
-        logger.info(String.format("%d Received Initial response from Transcribe. Request Id: %s",
+        logger.info(String.format("%d Received initial response from Transcribe. Request Id: %s",
                 System.currentTimeMillis(), r.requestId()));
     }
 
@@ -59,4 +68,3 @@ public class StreamTranscriptionBehaviorImpl implements StreamTranscriptionBehav
         logger.info("Transcribe stream completed");
     }
 }
-
