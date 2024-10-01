@@ -72,23 +72,17 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
     private static final String START_SELECTOR_TYPE = System.getenv("START_SELECTOR_TYPE");
     private static final String TABLE_CALLER_TRANSCRIPT = System.getenv("TABLE_CALLER_TRANSCRIPT");
     private static final String TABLE_CALLER_TRANSCRIPT_TO_CUSTOMER = System.getenv("TABLE_CALLER_TRANSCRIPT_TO_CUSTOMER");
+    private static final String CONVERSATION_TABLE_NAME = System.getenv("CONVERSATION_TABLE_NAME");
 
     private static final Logger logger = LoggerFactory.getLogger(KVSTranscribeStreamingLambda.class);
     public static final MetricsUtil metricsUtil = new MetricsUtil(AmazonCloudWatchClientBuilder.defaultClient());
     private static final DateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ");
 
-
     // SegmentWriter saves Transcription segments to DynamoDB
     private TranscribedSegmentWriter fromCustomerSegmentWriter = null;
     private TranscribedSegmentWriter toCustomerSegmentWriter = null;
 
-    /**
-     * Handler function for the Lambda
-     *
-     * @param request
-     * @param context
-     * @return
-     */
+
     @Override
     public String handleRequest(TranscriptionRequest request, Context context) {
 
@@ -102,10 +96,15 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
             // create a SegmentWriter to be able to save off transcription results
             AmazonDynamoDBClientBuilder builder = AmazonDynamoDBClientBuilder.standard();
             builder.setRegion(REGION.getName());
-            fromCustomerSegmentWriter = new TranscribedSegmentWriter(request.getConnectContactId(), new DynamoDB(builder.build()),
+            DynamoDB dynamoDB = new DynamoDB(builder.build());
+
+            fromCustomerSegmentWriter = new TranscribedSegmentWriter(request.getConnectContactId(), dynamoDB,
                     CONSOLE_LOG_TRANSCRIPT_FLAG);
-            toCustomerSegmentWriter = new TranscribedSegmentWriter(request.getConnectContactId(), new DynamoDB(builder.build()),
+            fromCustomerSegmentWriter.setParticipantRole("Customer");
+
+            toCustomerSegmentWriter = new TranscribedSegmentWriter(request.getConnectContactId(), dynamoDB,
                     CONSOLE_LOG_TRANSCRIPT_FLAG);
+            toCustomerSegmentWriter.setParticipantRole("Agent");
 
             // If an inputFileName has been provided in the request, stream audio from the file to Transcribe
             if (request.getInputFileName() != null) {
@@ -126,17 +125,7 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
         }
     }
 
-    /**
-     * Starts streaming between KVS and Transcribe
-     * The transcript segments are continuously saved to the Dynamo DB table
-     * At end of the streaming session, the raw audio is saved as an s3 object
-     *
-     * @param streamARN
-     * @param startFragmentNum
-     * @param contactId
-     * @param languageCode
-     * @throws Exception
-     */
+
     private void startKVSToTranscribeStreaming(String streamARN, String startFragmentNum, String contactId, boolean transcribeEnabled,
                                                Optional<String> languageCode, Optional<Boolean> saveCallRecording,
                                                boolean isStreamAudioFromCustomerEnabled, boolean isStreamAudioToCustomerEnabled) throws Exception {
@@ -156,7 +145,7 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
             try (TranscribeStreamingRetryClient client = new TranscribeStreamingRetryClient(getTranscribeCredentials(),
                     TRANSCRIBE_ENDPOINT, TRANSCRIBE_REGION, metricsUtil)) {
 
-                logger.info("Calling Transcribe service..");
+                logger.info("Calling Transcribe service...");
                 CompletableFuture<Void> fromCustomerResult = null;
                 CompletableFuture<Void> toCustomerResult = null;
 
@@ -172,11 +161,11 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
 
                 // Synchronous wait for stream to close, and close client connection
                 // Timeout of 890 seconds because the Lambda function can be run for at most 15 mins (~890 secs)
-                if (null != fromCustomerResult) {
+                if (fromCustomerResult != null) {
                     fromCustomerResult.get(890, TimeUnit.SECONDS);
                 }
 
-                if (null != toCustomerResult) {
+                if (toCustomerResult != null) {
                     toCustomerResult.get(890, TimeUnit.SECONDS);
                 }
 
@@ -199,7 +188,7 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
             try {
                 logger.info("Saving audio bytes to location");
 
-                //Write audio bytes from the KVS stream to the temporary file
+                // Write audio bytes from the KVS stream to the temporary file
                 if (kvsStreamTrackObjectFromCustomer != null) {
                     writeAudioBytesToKvsStream(kvsStreamTrackObjectFromCustomer, contactId);
                 }
@@ -218,14 +207,7 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
         }
     }
 
-    /**
-     * Fetches the specified audio file from S3
-     * The transcript segments are continuously saved to the Dynamo DB table
-     *
-     * @param inputFileName
-     * @param languageCode the language code to be used for Transcription (optional; see https://docs.aws.amazon.com/transcribe/latest/dg/API_streaming_StartStreamTranscription.html#API_streaming_StartStreamTranscription_RequestParameters )
-     * @throws Exception
-     */
+
     private void startFileToTranscribeStreaming(String inputFileName, Optional<String> languageCode) throws Exception {
 
         // get the audio from S3
@@ -238,13 +220,13 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
         try (TranscribeStreamingRetryClient client = new TranscribeStreamingRetryClient(getTranscribeCredentials(),
                 TRANSCRIBE_ENDPOINT, TRANSCRIBE_REGION, metricsUtil)) {
 
-            logger.info("Calling Transcribe service..");
+            logger.info("Calling Transcribe service...");
 
             CompletableFuture<Void> result = client.startStreamTranscription(
                     // since we're definitely working with telephony audio, we know that's 8 kHz
                     getRequest(8000, languageCode),
                     new FileAudioStreamPublisher(inputStream),
-                    new StreamTranscriptionBehaviorImpl(fromCustomerSegmentWriter, TABLE_CALLER_TRANSCRIPT),
+                    new StreamTranscriptionBehaviorImpl(fromCustomerSegmentWriter, TABLE_CALLER_TRANSCRIPT, CONVERSATION_TABLE_NAME),
                     "None"
             );
 
@@ -262,26 +244,20 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
         }
     }
 
-    /**
-     * Closes the FileOutputStream and uploads the Raw audio file to S3
-     *
-     * @param kvsStreamTrackObject
-     * @param saveCallRecording should the call recording be uploaded to S3?
-     * @throws IOException
-     */
+
     private void closeFileAndUploadRawAudio(KVSStreamTrackObject kvsStreamTrackObject, String contactId, Optional<Boolean> saveCallRecording) throws IOException {
 
         kvsStreamTrackObject.getInputStream().close();
         kvsStreamTrackObject.getOutputStream().close();
 
-        //Upload the Raw Audio file to S3
+        // Upload the Raw Audio file to S3
         if ((saveCallRecording.isPresent() ? saveCallRecording.get() : false) && (new File(kvsStreamTrackObject.getSaveAudioFilePath().toString()).length() > 0)) {
             AudioUtils.uploadRawAudio(REGION, RECORDINGS_BUCKET_NAME, RECORDINGS_KEY_PREFIX, kvsStreamTrackObject.getSaveAudioFilePath().toString(), contactId, RECORDINGS_PUBLIC_READ_ACL,
                     getAWSCredentials());
         } else {
-            logger.info("Skipping upload to S3.  saveCallRecording was disabled or audio file has 0 bytes: " + kvsStreamTrackObject.getSaveAudioFilePath().toString());
+            logger.info("Skipping upload to S3. saveCallRecording was disabled or audio file has 0 bytes: " + kvsStreamTrackObject.getSaveAudioFilePath().toString());
         }
-        //Delete raw files from the lambda function
+        // Delete raw files from the lambda function
         File fileToDelete = new File(kvsStreamTrackObject.getSaveAudioFilePath().toString());
         if (fileToDelete != null) {
             Boolean deletionResult = fileToDelete.delete();
@@ -289,16 +265,7 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
         }
     }
 
-    /**
-     * Create all objects necessary for KVS streaming from each track
-     *
-     * @param streamName
-     * @param startFragmentNum
-     * @param trackName
-     * @param contactId
-     * @return
-     * @throws FileNotFoundException
-     */
+
     private KVSStreamTrackObject getKVSStreamTrackObject(String streamName, String startFragmentNum, String trackName,
                                                          String contactId) throws FileNotFoundException {
         InputStream kvsInputStream = KVSUtils.getInputStreamFromKVS(streamName, REGION, startFragmentNum, getAWSCredentials(), START_SELECTOR_TYPE);
@@ -314,7 +281,6 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
         return new KVSStreamTrackObject(kvsInputStream, streamingMkvReader, tagProcessor, fragmentVisitor, saveAudioFilePath, fileOutputStream, trackName);
     }
 
-
     private CompletableFuture<Void> getStartStreamingTranscriptionFuture(KVSStreamTrackObject kvsStreamTrackObject, Optional<String> languageCode,
                                                                          String contactId, TranscribeStreamingRetryClient client,
                                                                          TranscribedSegmentWriter transcribedSegmentWriter,
@@ -329,18 +295,11 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
                         kvsStreamTrackObject.getTagProcessor(),
                         kvsStreamTrackObject.getFragmentVisitor(),
                         kvsStreamTrackObject.getTrackName()),
-                new StreamTranscriptionBehaviorImpl(transcribedSegmentWriter, tableName),
+                new StreamTranscriptionBehaviorImpl(transcribedSegmentWriter, tableName, CONVERSATION_TABLE_NAME),
                 channel
         );
     }
 
-    /**
-     * Write the kvs stream to the output buffer
-     *
-     * @param kvsStreamTrackObject
-     * @param contactId
-     * @throws Exception
-     */
     private void writeAudioBytesToKvsStream(KVSStreamTrackObject kvsStreamTrackObject, String contactId) throws Exception {
 
         ByteBuffer audioBuffer = KVSUtils.getByteBufferFromStream(kvsStreamTrackObject.getStreamingMkvReader(),
@@ -355,50 +314,32 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
         }
     }
 
-    /**
-     * @return AWS credentials to be used to connect to s3 (for fetching and uploading audio) and KVS
-     */
+
     private static AWSCredentialsProvider getAWSCredentials() {
         return DefaultAWSCredentialsProviderChain.getInstance();
     }
 
-    /**
-     * @return AWS credentials to be used to connect to Transcribe service. This example uses the default credentials
-     * provider, which looks for environment variables (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY) or a credentials
-     * file on the system running this program.
-     */
+
     private static AwsCredentialsProvider getTranscribeCredentials() {
         return DefaultCredentialsProvider.create();
     }
 
-    /**
-     * Build StartStreamTranscriptionRequestObject containing required parameters to open a streaming transcription
-     * request, such as audio sample rate and language spoken in audio
-     *
-     * @param mediaSampleRateHertz sample rate of the audio to be streamed to the service in Hertz
-     * @param languageCode the language code to be used for Transcription (optional; see https://docs.aws.amazon.com/transcribe/latest/dg/API_streaming_StartStreamTranscription.html#API_streaming_StartStreamTranscription_RequestParameters )
-     * @return StartStreamTranscriptionRequest to be used to open a stream to transcription service
-     */
-    private static StartStreamTranscriptionRequest getRequest(Integer mediaSampleRateHertz, Optional <String> languageCode) {
+    private static StartStreamTranscriptionRequest getRequest(Integer mediaSampleRateHertz, Optional<String> languageCode) {
 
         return StartStreamTranscriptionRequest.builder()
-                .languageCode(languageCode.isPresent() ? languageCode.get() : LanguageCode.EN_US.toString())
+                .languageCode(languageCode.orElse(LanguageCode.EN_US.toString()))
                 .mediaEncoding(MediaEncoding.PCM)
                 .mediaSampleRateHertz(mediaSampleRateHertz)
                 .build();
     }
 
-    /**
-     * KVSAudioStreamPublisher implements audio stream publisher.
-     * It emits audio events from a KVS stream asynchronously in a separate thread
-     */
     private static class KVSAudioStreamPublisher implements Publisher<AudioStream> {
         private final StreamingMkvReader streamingMkvReader;
-        private String contactId;
-        private OutputStream outputStream;
-        private KVSContactTagProcessor tagProcessor;
-        private FragmentMetadataVisitor fragmentVisitor;
-        private String track;
+        private final String contactId;
+        private final OutputStream outputStream;
+        private final KVSContactTagProcessor tagProcessor;
+        private final FragmentMetadataVisitor fragmentVisitor;
+        private final String track;
 
         private KVSAudioStreamPublisher(StreamingMkvReader streamingMkvReader, String contactId, OutputStream outputStream,
                                         KVSContactTagProcessor tagProcessor, FragmentMetadataVisitor fragmentVisitor,
@@ -417,10 +358,6 @@ public class KVSTranscribeStreamingLambda implements RequestHandler<Transcriptio
         }
     }
 
-    /**
-     * FileAudioStreamPublisher implements audio stream publisher.
-     * It emits audio events from a File InputStream asynchronously in a separate thread
-     */
     private static class FileAudioStreamPublisher implements Publisher<AudioStream> {
 
         private final InputStream inputStream;
