@@ -11,6 +11,9 @@ import software.amazon.awssdk.services.transcribestreaming.model.TranscriptEvent
 import java.text.NumberFormat;
 import java.time.Instant;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Collections;
+
 
 /**
  * TranscribedSegmentWriter writes the transcript segments to DynamoDB
@@ -35,14 +38,22 @@ public class TranscribedSegmentWriter {
     private String contactId;
     private DynamoDB ddbClient;
     private Boolean consoleLogTranscriptFlag;
+    private String participantRole; // "Agent" or "Customer"
     private static final boolean SAVE_PARTIAL_TRANSCRIPTS = Boolean.parseBoolean(System.getenv("SAVE_PARTIAL_TRANSCRIPTS"));
     private static final Logger logger = LoggerFactory.getLogger(TranscribedSegmentWriter.class);
+
 
     public TranscribedSegmentWriter(String contactId, DynamoDB ddbClient, Boolean consoleLogTranscriptFlag) {
 
         this.contactId = Validate.notNull(contactId);
         this.ddbClient = Validate.notNull(ddbClient);
         this.consoleLogTranscriptFlag = Validate.notNull(consoleLogTranscriptFlag);
+
+    }
+
+
+    public void setParticipantRole(String participantRole) {
+        this.participantRole = Validate.notNull(participantRole);
     }
 
     public String getContactId() {
@@ -55,8 +66,9 @@ public class TranscribedSegmentWriter {
         return this.ddbClient;
     }
 
-    public void writeToDynamoDB(TranscriptEvent transcriptEvent, String tableName) {
-        logger.info("table name: " + tableName);
+
+    public void writeToDynamoDB(TranscriptEvent transcriptEvent, String tableName, String conversationTableName) {
+        logger.info("Table name: " + tableName);
         logger.info("Transcription event: " + transcriptEvent.transcript().toString());
         List<Result> results = transcriptEvent.transcript().results();
         if (results.size() > 0) {
@@ -67,15 +79,20 @@ public class TranscribedSegmentWriter {
                 try {
                     Item ddbItem = toDynamoDbItem(result);
                     if (ddbItem != null) {
+                        // Write the individual transcript to the transcript table
                         getDdbClient().getTable(tableName).putItem(ddbItem);
+
+                        // Update the conversation table with the SegmentId
+                        updateConversationTable(result.resultId(), conversationTableName);
                     }
 
                 } catch (Exception e) {
-                    logger.error("Exception while writing to DDB: ", e);
+                    logger.error("Exception while writing to DynamoDB: ", e);
                 }
             }
         }
     }
+
 
     private Item toDynamoDbItem(Result result) {
 
@@ -114,5 +131,44 @@ public class TranscribedSegmentWriter {
         }
 
         return ddbItem;
+    }
+
+    private void updateConversationTable(String segmentId, String conversationTableName) {
+        if (participantRole == null) {
+            logger.error("Participant role is not set. Cannot update conversation table.");
+            return;
+        }
+
+        Table conversationTable = getDdbClient().getTable(conversationTableName);
+        String contactId = this.getContactId();
+
+        try {
+            String idsAttributeName;
+            // Determine which list to update based on participantRole
+            if ("Agent".equalsIgnoreCase(this.participantRole)) {
+                idsAttributeName = "AgentConversationMessageIds";
+            } else if ("Customer".equalsIgnoreCase(this.participantRole)) {
+                idsAttributeName = "UserConversationMessageIds";
+            } else {
+                throw new IllegalArgumentException("Invalid participantRole: " + this.participantRole);
+            }
+
+            // Build the update expression to append the SegmentId to the list
+            UpdateItemSpec updateItemSpec = new UpdateItemSpec()
+                    .withPrimaryKey("ContactId", contactId)
+                    .withUpdateExpression("SET #ids = list_append(if_not_exists(#ids, :empty_list), :segmentId), LLMStatus = if_not_exists(LLMStatus, :empty_string)")
+                    .withNameMap(new NameMap().with("#ids", idsAttributeName))
+                    .withValueMap(new ValueMap()
+                            .withList(":segmentId", Collections.singletonList(segmentId))
+                            .withList(":empty_list", new ArrayList<>())
+                            .withString(":empty_string", ""))
+                    .withReturnValues(ReturnValue.UPDATED_NEW);
+
+            // Update the conversation table in DynamoDB
+            conversationTable.updateItem(updateItemSpec);
+
+        } catch (Exception e) {
+            logger.error("Failed to update conversation table: ", e);
+        }
     }
 }
